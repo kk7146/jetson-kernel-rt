@@ -117,6 +117,371 @@
 #include <net/ipv6_stubs.h>
 #endif
 
+// TEST: for latency measurement of udp_sendmsg
+#include <linux/ktime.h>
+#include <linux/debugfs.h>
+#include <linux/atomic.h>
+#include <linux/spinlock.h>
+
+#define UDP_CALL_TRACE_MAX     8192
+#define UDP_CALL_TRACE_STRIDE  128
+
+
+// TEST: for latency measurement of udp_sendmsg
+
+
+struct udp_sendmsg_call_record {
+	u64 seq;
+	u64 total_ns;
+	__be32 saddr;
+	__be32 daddr;
+	u32 pid;
+	char comm[TASK_COMM_LEN];
+};
+
+struct udp_call_trace_buffer {
+	atomic64_t enabled;
+	atomic64_t seq;
+	u64 slow_threshold_ns;
+	u32 sample_stride;
+
+	spinlock_t lock;
+	u32 head;
+	u32 count;
+	struct udp_sendmsg_call_record recs[UDP_CALL_TRACE_MAX];
+};
+
+static struct udp_call_trace_buffer udp_call_trace;
+
+static struct dentry *udp_lat_debugfs_dir;
+
+static ssize_t udp_call_trace_enable_read(struct file *file,
+					  char __user *buf,
+					  size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	int n;
+
+	n = scnprintf(kbuf, sizeof(kbuf), "%lld\n",
+		      (long long)atomic64_read(&udp_call_trace.enabled));
+	return simple_read_from_buffer(buf, len, ppos, kbuf, n);
+}
+
+static ssize_t udp_call_trace_enable_write(struct file *file,
+					   const char __user *buf,
+					   size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	long val;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (kstrtol(kbuf, 0, &val))
+		return -EINVAL;
+
+	atomic64_set(&udp_call_trace.enabled, !!val);
+	return len;
+}
+
+static ssize_t udp_call_trace_clear_write(struct file *file,
+					  const char __user *buf,
+					  size_t len, loff_t *ppos)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&udp_call_trace.lock, flags);
+	udp_call_trace.head = 0;
+	udp_call_trace.count = 0;
+	atomic64_set(&udp_call_trace.seq, 0);
+	spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+
+	return len;
+}
+
+static const struct file_operations udp_call_trace_clear_fops = {
+	.owner  = THIS_MODULE,
+	.write  = udp_call_trace_clear_write,
+	.llseek = no_llseek,
+};
+
+static ssize_t udp_call_trace_threshold_read(struct file *file,
+					     char __user *buf,
+					     size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	int n;
+
+	n = scnprintf(kbuf, sizeof(kbuf), "%llu\n",
+		      READ_ONCE(udp_call_trace.slow_threshold_ns));
+	return simple_read_from_buffer(buf, len, ppos, kbuf, n);
+}
+
+static ssize_t udp_call_trace_threshold_write(struct file *file,
+					      const char __user *buf,
+					      size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	unsigned long long val;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (kstrtoull(kbuf, 0, &val))
+		return -EINVAL;
+
+	WRITE_ONCE(udp_call_trace.slow_threshold_ns, val);
+	return len;
+}
+
+static ssize_t udp_call_trace_stride_read(struct file *file,
+					  char __user *buf,
+					  size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	int n;
+
+	n = scnprintf(kbuf, sizeof(kbuf), "%u\n",
+		      READ_ONCE(udp_call_trace.sample_stride));
+	return simple_read_from_buffer(buf, len, ppos, kbuf, n);
+}
+
+static ssize_t udp_call_trace_stride_write(struct file *file,
+					   const char __user *buf,
+					   size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	unsigned int val;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (kstrtouint(kbuf, 0, &val))
+		return -EINVAL;
+
+	WRITE_ONCE(udp_call_trace.sample_stride, val);
+	return len;
+}
+
+static int udp_call_trace_dump_show(struct seq_file *m, void *v)
+{
+	struct udp_sendmsg_call_record *tmp;
+	unsigned long flags;
+	u32 count, head, start, i;
+
+	seq_puts(m,
+		 "seq pid comm "
+		 "saddr daddr "
+		 "total_ns entry_phase_ns addr_phase_ns "
+		 "ctrl_opt_phase_ns route_prep_phase_ns dst_cache_phase_ns "
+		 "route_lookup_phase_ns fast_tx_phase_ns cork_setup_phase_ns "
+		 "append_push_phase_ns\n");
+
+	spin_lock_irqsave(&udp_call_trace.lock, flags);
+
+	count = udp_call_trace.count;
+	head = udp_call_trace.head;
+
+	if (!count) {
+		spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+		return 0;
+	}
+
+	tmp = kmalloc_array(count, sizeof(*tmp), GFP_ATOMIC);
+	if (!tmp) {
+		spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+		return -ENOMEM;
+	}
+
+	start = (head + UDP_CALL_TRACE_MAX - count) % UDP_CALL_TRACE_MAX;
+	for (i = 0; i < count; i++) {
+		u32 idx = (start + i) % UDP_CALL_TRACE_MAX;
+		tmp[i] = udp_call_trace.recs[idx];
+	}
+
+	spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+
+	for (i = 0; i < count; i++) {
+		struct udp_sendmsg_call_record *r = &tmp[i];
+
+		seq_printf(m,
+			   "%llu %u %s %pI4 %pI4 "
+			   "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+			   r->seq,
+			   r->pid,
+			   r->comm,
+			   &r->saddr,
+			   &r->daddr,
+			   r->total_ns,
+			   r->entry_phase_ns,
+			   r->addr_phase_ns,
+			   r->ctrl_opt_phase_ns,
+			   r->route_prep_phase_ns,
+			   r->dst_cache_phase_ns,
+			   r->route_lookup_phase_ns,
+			   r->fast_tx_phase_ns,
+			   r->cork_setup_phase_ns,
+			   r->append_push_phase_ns);
+	}
+
+	kfree(tmp);
+	return 0;
+}
+
+static int udp_call_trace_dump_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, udp_call_trace_dump_show, NULL);
+}
+
+static const struct file_operations udp_call_trace_dump_fops = {
+	.owner   = THIS_MODULE,
+	.open    = udp_call_trace_dump_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static const struct file_operations udp_call_trace_stride_fops = {
+	.owner  = THIS_MODULE,
+	.read   = udp_call_trace_stride_read,
+	.write  = udp_call_trace_stride_write,
+	.llseek = default_llseek,
+};
+
+static const struct file_operations udp_call_trace_threshold_fops = {
+	.owner  = THIS_MODULE,
+	.read   = udp_call_trace_threshold_read,
+	.write  = udp_call_trace_threshold_write,
+	.llseek = default_llseek,
+};
+
+static const struct file_operations udp_call_trace_enable_fops = {
+	.owner  = THIS_MODULE,
+	.read   = udp_call_trace_enable_read,
+	.write  = udp_call_trace_enable_write,
+	.llseek = default_llseek,
+};
+
+static int __init udp_sendmsg_lat_init_debugfs(void)
+{
+	udp_lat_debugfs_dir = debugfs_create_dir("udp_lat", NULL);
+	if (IS_ERR_OR_NULL(udp_lat_debugfs_dir))
+		return -ENOMEM;
+
+	debugfs_create_file("call_enable", 0644,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_enable_fops);
+
+	debugfs_create_file("call_clear", 0200,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_clear_fops);
+
+	debugfs_create_file("call_dump", 0444,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_dump_fops);
+
+	debugfs_create_file("call_threshold_ns", 0644,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_threshold_fops);
+
+	debugfs_create_file("call_stride", 0644,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_stride_fops);
+
+	atomic64_set(&udp_call_trace.enabled, 0);
+	atomic64_set(&udp_call_trace.seq, 0);
+	udp_call_trace.slow_threshold_ns = 50000;
+	udp_call_trace.sample_stride = UDP_CALL_TRACE_STRIDE;
+	spin_lock_init(&udp_call_trace.lock);
+	udp_call_trace.head = 0;
+	udp_call_trace.count = 0;
+
+	return 0;
+}
+
+static bool udp_call_trace_should_store(u64 seq, u64 total_ns)
+{
+	u32 stride = READ_ONCE(udp_call_trace.sample_stride);
+	u64 thres = READ_ONCE(udp_call_trace.slow_threshold_ns);
+
+	if (thres && total_ns >= thres)
+		return true;
+
+	if (stride && (seq % stride) == 0)
+		return true;
+
+	return false;
+}
+
+static void udp_call_trace_record(u64 total_ns,
+				  u64 entry_phase_ns,
+				  u64 addr_phase_ns,
+				  u64 ctrl_opt_phase_ns,
+				  u64 route_prep_phase_ns,
+				  u64 dst_cache_phase_ns,
+				  u64 route_lookup_phase_ns,
+				  u64 fast_tx_phase_ns,
+				  u64 cork_setup_phase_ns,
+				  u64 append_push_phase_ns,
+				  __be32 saddr,
+				  __be32 daddr)
+{
+	struct udp_sendmsg_call_record *r;
+	unsigned long flags;
+	u64 seq;
+
+	if (!atomic64_read(&udp_call_trace.enabled))
+		return;
+
+	seq = atomic64_inc_return(&udp_call_trace.seq);
+
+	if (!udp_call_trace_should_store(seq, total_ns))
+		return;
+
+	spin_lock_irqsave(&udp_call_trace.lock, flags);
+
+	r = &udp_call_trace.recs[udp_call_trace.head];
+	r->seq = seq;
+	r->total_ns = total_ns;
+	r->entry_phase_ns = entry_phase_ns;
+	r->addr_phase_ns = addr_phase_ns;
+	r->ctrl_opt_phase_ns = ctrl_opt_phase_ns;
+	r->route_prep_phase_ns = route_prep_phase_ns;
+	r->dst_cache_phase_ns = dst_cache_phase_ns;
+	r->route_lookup_phase_ns = route_lookup_phase_ns;
+	r->fast_tx_phase_ns = fast_tx_phase_ns;
+	r->cork_setup_phase_ns = cork_setup_phase_ns;
+	r->append_push_phase_ns = append_push_phase_ns;
+	r->saddr = saddr;
+	r->daddr = daddr;
+	r->pid = current->pid;
+	get_task_comm(r->comm, current);
+
+	udp_call_trace.head = (udp_call_trace.head + 1) % UDP_CALL_TRACE_MAX;
+	if (udp_call_trace.count < UDP_CALL_TRACE_MAX)
+		udp_call_trace.count++;
+
+	spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+}
+
+late_initcall(udp_sendmsg_lat_init_debugfs);
+
+// END TEST
+
 struct udp_table udp_table __read_mostly;
 EXPORT_SYMBOL(udp_table);
 
@@ -1388,7 +1753,7 @@ do_append_data:
 	if (err) {
 		udp_flush_pending_frames(sk);
 	} else if (!corkreq) {
-		err = udp_push_pending_frames(sk);
+		err = udp_push_pending_frames(sk); // 여기 안에 udp_send_skb가 들어있음
 	}
 	else if (unlikely(skb_queue_empty(&sk->sk_write_queue)))
 		up->pending = 0;
