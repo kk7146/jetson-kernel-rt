@@ -1,0 +1,4 @@
+_out/Linux_aarch64/g_nvid_string.o: _out/Linux_aarch64/g_nvid_string.c \
+ ../common/sdk/nvidia/inc/cpuopsys.h
+
+../common/sdk/nvidia/inc/cpuopsys.h:

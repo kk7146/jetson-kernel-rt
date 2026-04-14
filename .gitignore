@@ -1,0 +1,46 @@
+# archives / staging
+public_sources.tbz2
+out-rt-mod/
+out-native-mod/
+*.tar.gz
+
+# generic kernel build outputs
+**/*.o
+**/*.a
+**/*.so
+**/*.ko
+**/*.mod
+**/*.mod.c
+**/*.cmd
+**/*.d
+**/*.tmp
+**/*.lst
+**/*.order
+**/*.symvers
+
+# kernel generated files
+**/Module.symvers
+**/modules.order
+**/System.map
+**/vmlinux
+**/vmlinuz
+**/Image
+**/zImage
+**/bzImage
+**/.tmp_versions/
+**/.cache.mk
+**/.*.cmd
+**/.config.old
+
+# generated config headers / dtb
+**/include/config/
+**/include/generated/
+**/arch/arm64/boot/dts/**/*.dtb
+**/arch/arm64/boot/dts/**/*.dtbo
+
+# editor / OS junk
+**/.DS_Store
+**/.vscode/
+**/.idea/
+# source tarballs
+**/kernel_src.tbz2

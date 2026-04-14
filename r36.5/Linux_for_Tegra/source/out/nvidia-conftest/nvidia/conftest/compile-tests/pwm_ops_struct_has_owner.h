@@ -1,0 +1,1 @@
+#define NV_PWM_OPS_STRUCT_HAS_OWNER
