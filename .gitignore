@@ -3,6 +3,8 @@ public_sources.tbz2
 out-rt-mod/
 out-native-mod/
 *.tar.gz
+**/*.tbz2
+**/*.tar.bz2
 
 # generic kernel build outputs
 **/*.o

@@ -1,7 +1,3 @@
-cd ~/Desktop/github/jetson-kernel-rt
-git add .
-git status
-
 ### RT
 
 #### 커널 본체 + in-tree modules 빌드
