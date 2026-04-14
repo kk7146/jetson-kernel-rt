@@ -117,6 +117,943 @@
 #include <net/ipv6_stubs.h>
 #endif
 
+// TEST: for latency measurement of udp_sendmsg
+#include <linux/ktime.h>
+#include <linux/percpu.h>
+#include <linux/debugfs.h>
+#include <linux/cpumask.h>
+
+#define UDP_LAT_HIST_BUCKETS   32
+
+#define UDP_CALL_TRACE_MAX     8192
+#define UDP_CALL_TRACE_STRIDE  128
+// END TEST
+
+// TEST: tracepoints for udp_sendmsg path
+#include <linux/atomic.h>
+#include <linux/spinlock.h>
+#include <linux/bitops.h>
+
+#define UDP_PATH_NR_BITS 26
+// END TEST
+
+
+// TEST: for latency measurement of udp_sendmsg
+
+struct udp_lat_stats {
+	u64 count;
+	u64 total_ns;
+	u64 min_ns;
+	u64 max_ns;
+	u64 hist[UDP_LAT_HIST_BUCKETS];
+};
+
+struct udp_sendmsg_call_record {
+	u64 seq;
+	u64 path_mask;
+	u64 cmsg_mask;
+
+	u64 total_ns;
+	u64 entry_phase_ns;
+	u64 addr_phase_ns;
+	u64 ctrl_opt_phase_ns;
+	u64 route_prep_phase_ns;
+	u64 dst_cache_phase_ns;
+	u64 route_lookup_phase_ns;
+	u64 fast_tx_phase_ns;
+	u64 cork_setup_phase_ns;
+	u64 append_push_phase_ns;
+
+	__be32 saddr;
+	__be32 daddr;
+	__be16 sport;
+	__be16 dport;
+
+	u32 pid;
+	u32 cpu;
+	char comm[TASK_COMM_LEN];
+};
+
+struct udp_call_trace_buffer {
+	atomic64_t enabled;
+	atomic64_t seq;
+	u64 slow_threshold_ns;
+	u32 sample_stride;
+
+	spinlock_t lock;
+	u32 head;
+	u32 count;
+	struct udp_sendmsg_call_record recs[UDP_CALL_TRACE_MAX];
+};
+
+enum udp_lat_stage_id {
+	UDP_LAT_TOTAL = 0,
+	UDP_LAT_ENTRY_PHASE,
+	UDP_LAT_ADDR_PHASE,
+	UDP_LAT_CTRL_OPT_PHASE,
+	UDP_LAT_ROUTE_PREP_PHASE,
+	UDP_LAT_DST_CACHE_PHASE,
+	UDP_LAT_ROUTE_LOOKUP_PHASE,
+	UDP_LAT_FAST_TX_PHASE,
+	UDP_LAT_CORK_SETUP_PHASE,
+	UDP_LAT_APPEND_PUSH_PHASE,
+	UDP_LAT_STAGE_MAX,
+};
+
+struct udp_lat_agg {
+	u64 count;
+	u64 total_ns;
+	u64 min_ns;
+	u64 max_ns;
+	u64 hist[UDP_LAT_HIST_BUCKETS];
+};
+
+struct udp_stage_lat_stats {
+	struct udp_lat_stats stage[UDP_LAT_STAGE_MAX];
+};
+
+struct udp_stage_lat_agg {
+	struct udp_lat_agg stage[UDP_LAT_STAGE_MAX];
+};
+
+static struct udp_call_trace_buffer udp_call_trace;
+
+static DEFINE_PER_CPU(struct udp_stage_lat_stats, udp_sendmsg_stage_lat_stats);
+
+static const char * const udp_lat_stage_names[UDP_LAT_STAGE_MAX] = {
+	[UDP_LAT_TOTAL]              = "total",
+	[UDP_LAT_ENTRY_PHASE]        = "entry_phase",
+	[UDP_LAT_ADDR_PHASE]         = "addr_phase",
+	[UDP_LAT_CTRL_OPT_PHASE]     = "ctrl_opt_phase",
+	[UDP_LAT_ROUTE_PREP_PHASE]   = "route_prep_phase",
+	[UDP_LAT_DST_CACHE_PHASE]    = "dst_cache_phase",
+	[UDP_LAT_ROUTE_LOOKUP_PHASE] = "route_lookup_phase",
+	[UDP_LAT_FAST_TX_PHASE]      = "fast_tx_phase",
+	[UDP_LAT_CORK_SETUP_PHASE]   = "cork_setup_phase",
+	[UDP_LAT_APPEND_PUSH_PHASE]  = "append_push_phase",
+};
+
+static struct dentry *udp_lat_debugfs_dir;
+static struct dentry *udp_lat_debugfs_file;
+
+static inline u32 udp_lat_bucket_index(u64 delta_ns)
+{
+	u32 idx = 0;
+	u64 v = delta_ns >> 7; /* 128ns 단위 시작 */
+
+	while (v > 1 && idx < UDP_LAT_HIST_BUCKETS - 1) {
+		v >>= 1;
+		idx++;
+	}
+	return idx;
+}
+
+static void udp_lat_bucket_range(u32 idx, u64 *low, u64 *high)
+{
+	*low = 128ULL << idx;
+	*high = (128ULL << (idx + 1)) - 1;
+}
+
+static inline void udp_sendmsg_lat_record_stage(enum udp_lat_stage_id stage_id,
+						u64 delta_ns)
+{
+	struct udp_stage_lat_stats *ps;
+	struct udp_lat_stats *s;
+	u32 bucket;
+
+	preempt_disable();
+	ps = this_cpu_ptr(&udp_sendmsg_stage_lat_stats);
+	s = &ps->stage[stage_id];
+
+	s->count++;
+	s->total_ns += delta_ns;
+
+	if (s->count == 1) {
+		s->min_ns = delta_ns;
+		s->max_ns = delta_ns;
+	} else {
+		if (delta_ns < s->min_ns)
+			s->min_ns = delta_ns;
+		if (delta_ns > s->max_ns)
+			s->max_ns = delta_ns;
+	}
+
+	bucket = udp_lat_bucket_index(delta_ns);
+	s->hist[bucket]++;
+
+	preempt_enable();
+}
+
+static void udp_sendmsg_lat_aggregate_stage(struct udp_stage_lat_agg *agg)
+{
+	int cpu, st;
+	bool first[UDP_LAT_STAGE_MAX];
+
+	memset(agg, 0, sizeof(*agg));
+	for (st = 0; st < UDP_LAT_STAGE_MAX; st++)
+		first[st] = true;
+
+	for_each_possible_cpu(cpu) {
+		struct udp_stage_lat_stats *ps =
+			per_cpu_ptr(&udp_sendmsg_stage_lat_stats, cpu);
+
+		for (st = 0; st < UDP_LAT_STAGE_MAX; st++) {
+			struct udp_lat_stats *s = &ps->stage[st];
+			struct udp_lat_agg *a = &agg->stage[st];
+			int i;
+
+			if (s->count == 0)
+				continue;
+
+			a->count += s->count;
+			a->total_ns += s->total_ns;
+
+			if (first[st]) {
+				a->min_ns = s->min_ns;
+				a->max_ns = s->max_ns;
+				first[st] = false;
+			} else {
+				if (s->min_ns < a->min_ns)
+					a->min_ns = s->min_ns;
+				if (s->max_ns > a->max_ns)
+					a->max_ns = s->max_ns;
+			}
+
+			for (i = 0; i < UDP_LAT_HIST_BUCKETS; i++)
+				a->hist[i] += s->hist[i];
+		}
+	}
+}
+
+static u64 udp_sendmsg_lat_percentile_ns(const struct udp_lat_agg *agg, u32 pct)
+{
+	u64 target, acc = 0;
+	u32 i;
+
+	if (!agg->count)
+		return 0;
+
+	target = (agg->count * pct + 99) / 100; /* ceil 비슷하게 */
+
+	for (i = 0; i < UDP_LAT_HIST_BUCKETS; i++) {
+		acc += agg->hist[i];
+		if (acc >= target) {
+			u64 low, high;
+			udp_lat_bucket_range(i, &low, &high);
+			return high; /* 보수적으로 bucket 상한 반환 */
+		}
+	}
+
+	return agg->max_ns;
+}
+
+static int udp_sendmsg_lat_show(struct seq_file *m, void *v)
+{
+	struct udp_stage_lat_agg agg;
+	int st, i;
+
+	udp_sendmsg_lat_aggregate_stage(&agg);
+
+	for (st = 0; st < UDP_LAT_STAGE_MAX; st++) {
+		struct udp_lat_agg *a = &agg.stage[st];
+		u64 avg_ns = 0, p50, p95, p99;
+
+		if (!a->count)
+			continue;
+
+		avg_ns = div64_u64(a->total_ns, a->count);
+		p50 = udp_sendmsg_lat_percentile_ns(a, 50);
+		p95 = udp_sendmsg_lat_percentile_ns(a, 95);
+		p99 = udp_sendmsg_lat_percentile_ns(a, 99);
+
+		seq_printf(m, "[%s]\n", udp_lat_stage_names[st]);
+		seq_printf(m, "count: %llu\n", a->count);
+		seq_printf(m, "avg_ns: %llu\n", avg_ns);
+		seq_printf(m, "min_ns: %llu\n", a->min_ns);
+		seq_printf(m, "max_ns: %llu\n", a->max_ns);
+		seq_printf(m, "p50_ns_approx: %llu\n", p50);
+		seq_printf(m, "p95_ns_approx: %llu\n", p95);
+		seq_printf(m, "p99_ns_approx: %llu\n", p99);
+
+		seq_puts(m, "histogram:\n");
+		for (i = 0; i < UDP_LAT_HIST_BUCKETS; i++) {
+			u64 low, high;
+			udp_lat_bucket_range(i, &low, &high);
+			seq_printf(m, "[%10llu .. %10llu] : %llu\n",
+				   low, high, a->hist[i]);
+		}
+		seq_putc(m, '\n');
+	}
+
+	return 0;
+}
+
+static int udp_sendmsg_lat_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, udp_sendmsg_lat_show, NULL);
+}
+
+static ssize_t udp_call_trace_enable_read(struct file *file,
+					  char __user *buf,
+					  size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	int n;
+
+	n = scnprintf(kbuf, sizeof(kbuf), "%lld\n",
+		      (long long)atomic64_read(&udp_call_trace.enabled));
+	return simple_read_from_buffer(buf, len, ppos, kbuf, n);
+}
+
+static ssize_t udp_call_trace_enable_write(struct file *file,
+					   const char __user *buf,
+					   size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	long val;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (kstrtol(kbuf, 0, &val))
+		return -EINVAL;
+
+	atomic64_set(&udp_call_trace.enabled, !!val);
+	return len;
+}
+
+static ssize_t udp_call_trace_clear_write(struct file *file,
+					  const char __user *buf,
+					  size_t len, loff_t *ppos)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&udp_call_trace.lock, flags);
+	udp_call_trace.head = 0;
+	udp_call_trace.count = 0;
+	atomic64_set(&udp_call_trace.seq, 0);
+	spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+
+	return len;
+}
+
+static const struct file_operations udp_call_trace_clear_fops = {
+	.owner  = THIS_MODULE,
+	.write  = udp_call_trace_clear_write,
+	.llseek = no_llseek,
+};
+
+static ssize_t udp_call_trace_threshold_read(struct file *file,
+					     char __user *buf,
+					     size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	int n;
+
+	n = scnprintf(kbuf, sizeof(kbuf), "%llu\n",
+		      READ_ONCE(udp_call_trace.slow_threshold_ns));
+	return simple_read_from_buffer(buf, len, ppos, kbuf, n);
+}
+
+static ssize_t udp_call_trace_threshold_write(struct file *file,
+					      const char __user *buf,
+					      size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	unsigned long long val;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (kstrtoull(kbuf, 0, &val))
+		return -EINVAL;
+
+	WRITE_ONCE(udp_call_trace.slow_threshold_ns, val);
+	return len;
+}
+
+static ssize_t udp_call_trace_stride_read(struct file *file,
+					  char __user *buf,
+					  size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	int n;
+
+	n = scnprintf(kbuf, sizeof(kbuf), "%u\n",
+		      READ_ONCE(udp_call_trace.sample_stride));
+	return simple_read_from_buffer(buf, len, ppos, kbuf, n);
+}
+
+static ssize_t udp_call_trace_stride_write(struct file *file,
+					   const char __user *buf,
+					   size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	unsigned int val;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (kstrtouint(kbuf, 0, &val))
+		return -EINVAL;
+
+	WRITE_ONCE(udp_call_trace.sample_stride, val);
+	return len;
+}
+
+static int udp_call_trace_dump_show(struct seq_file *m, void *v)
+{
+	struct udp_sendmsg_call_record *tmp;
+	unsigned long flags;
+	u32 count, head, start, i;
+
+	seq_puts(m,
+		 "seq cpu pid comm "
+		 "saddr sport daddr dport "
+		 "total_ns entry_phase_ns addr_phase_ns "
+		 "ctrl_opt_phase_ns route_prep_phase_ns dst_cache_phase_ns "
+		 "route_lookup_phase_ns fast_tx_phase_ns cork_setup_phase_ns "
+		 "append_push_phase_ns path_mask cmsg_mask\n");
+
+	spin_lock_irqsave(&udp_call_trace.lock, flags);
+
+	count = udp_call_trace.count;
+	head = udp_call_trace.head;
+
+	if (!count) {
+		spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+		return 0;
+	}
+
+	tmp = kmalloc_array(count, sizeof(*tmp), GFP_ATOMIC);
+	if (!tmp) {
+		spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+		return -ENOMEM;
+	}
+
+	start = (head + UDP_CALL_TRACE_MAX - count) % UDP_CALL_TRACE_MAX;
+	for (i = 0; i < count; i++) {
+		u32 idx = (start + i) % UDP_CALL_TRACE_MAX;
+		tmp[i] = udp_call_trace.recs[idx];
+	}
+
+	spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+
+	for (i = 0; i < count; i++) {
+		struct udp_sendmsg_call_record *r = &tmp[i];
+
+		seq_printf(m,
+			   "%llu %u %u %s %pI4 %u %pI4 %u "
+			   "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
+			   "0x%016llx 0x%016llx\n",
+			   r->seq,
+			   r->cpu,
+			   r->pid,
+			   r->comm,
+			   &r->saddr, ntohs(r->sport),
+			   &r->daddr, ntohs(r->dport),
+			   r->total_ns,
+			   r->entry_phase_ns,
+			   r->addr_phase_ns,
+			   r->ctrl_opt_phase_ns,
+			   r->route_prep_phase_ns,
+			   r->dst_cache_phase_ns,
+			   r->route_lookup_phase_ns,
+			   r->fast_tx_phase_ns,
+			   r->cork_setup_phase_ns,
+			   r->append_push_phase_ns,
+			   r->path_mask,
+			   r->cmsg_mask);
+	}
+
+	kfree(tmp);
+	return 0;
+}
+
+static int udp_call_trace_dump_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, udp_call_trace_dump_show, NULL);
+}
+
+static const struct file_operations udp_sendmsg_lat_fops = {
+	.owner   = THIS_MODULE,
+	.open    = udp_sendmsg_lat_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static const struct file_operations udp_call_trace_dump_fops = {
+	.owner   = THIS_MODULE,
+	.open    = udp_call_trace_dump_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static const struct file_operations udp_call_trace_stride_fops = {
+	.owner  = THIS_MODULE,
+	.read   = udp_call_trace_stride_read,
+	.write  = udp_call_trace_stride_write,
+	.llseek = default_llseek,
+};
+
+static const struct file_operations udp_call_trace_threshold_fops = {
+	.owner  = THIS_MODULE,
+	.read   = udp_call_trace_threshold_read,
+	.write  = udp_call_trace_threshold_write,
+	.llseek = default_llseek,
+};
+
+static const struct file_operations udp_call_trace_enable_fops = {
+	.owner  = THIS_MODULE,
+	.read   = udp_call_trace_enable_read,
+	.write  = udp_call_trace_enable_write,
+	.llseek = default_llseek,
+};
+
+static ssize_t udp_sendmsg_lat_reset_write(struct file *file,
+					   const char __user *buf,
+					   size_t len, loff_t *ppos)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct udp_stage_lat_stats *ps =
+			per_cpu_ptr(&udp_sendmsg_stage_lat_stats, cpu);
+		memset(ps, 0, sizeof(*ps));
+	}
+	return len;
+}
+
+static const struct file_operations udp_sendmsg_lat_reset_fops = {
+	.owner = THIS_MODULE,
+	.write = udp_sendmsg_lat_reset_write,
+};
+
+static int __init udp_sendmsg_lat_init_debugfs(void)
+{
+	udp_lat_debugfs_dir = debugfs_create_dir("udp_lat", NULL);
+	if (IS_ERR_OR_NULL(udp_lat_debugfs_dir))
+		return -ENOMEM;
+
+	udp_lat_debugfs_file = debugfs_create_file("sendmsg", 0444,
+						   udp_lat_debugfs_dir,
+						   NULL,
+						   &udp_sendmsg_lat_fops);
+	if (!udp_lat_debugfs_file)
+		return -ENOMEM;
+
+	debugfs_create_file("reset", 0200,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_sendmsg_lat_reset_fops);
+
+	debugfs_create_file("call_enable", 0644,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_enable_fops);
+
+	debugfs_create_file("call_clear", 0200,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_clear_fops);
+
+	debugfs_create_file("call_dump", 0444,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_dump_fops);
+
+	debugfs_create_file("call_threshold_ns", 0644,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_threshold_fops);
+
+	debugfs_create_file("call_stride", 0644,
+			    udp_lat_debugfs_dir,
+			    NULL,
+			    &udp_call_trace_stride_fops);
+
+
+	atomic64_set(&udp_call_trace.enabled, 0);
+	atomic64_set(&udp_call_trace.seq, 0);
+	udp_call_trace.slow_threshold_ns = 50000;
+	udp_call_trace.sample_stride = UDP_CALL_TRACE_STRIDE;
+	spin_lock_init(&udp_call_trace.lock);
+	udp_call_trace.head = 0;
+	udp_call_trace.count = 0;
+	
+	return 0;
+}
+
+static bool udp_call_trace_should_store(u64 seq, u64 total_ns)
+{
+	u32 stride = READ_ONCE(udp_call_trace.sample_stride);
+	u64 thres = READ_ONCE(udp_call_trace.slow_threshold_ns);
+
+	if (thres && total_ns >= thres)
+		return true;
+
+	if (stride && (seq % stride) == 0)
+		return true;
+
+	return false;
+}
+
+static void udp_call_trace_record(u64 path_mask,
+				  u64 cmsg_mask,
+				  u64 total_ns,
+				  u64 entry_phase_ns,
+				  u64 addr_phase_ns,
+				  u64 ctrl_opt_phase_ns,
+				  u64 route_prep_phase_ns,
+				  u64 dst_cache_phase_ns,
+				  u64 route_lookup_phase_ns,
+				  u64 fast_tx_phase_ns,
+				  u64 cork_setup_phase_ns,
+				  u64 append_push_phase_ns,
+				  __be32 saddr,
+				  __be32 daddr,
+				  __be16 sport,
+				  __be16 dport)
+{
+	struct udp_sendmsg_call_record *r;
+	unsigned long flags;
+	u64 seq;
+
+	if (!atomic64_read(&udp_call_trace.enabled))
+		return;
+
+	seq = atomic64_inc_return(&udp_call_trace.seq);
+
+	if (!udp_call_trace_should_store(seq, total_ns))
+		return;
+
+	spin_lock_irqsave(&udp_call_trace.lock, flags);
+
+	r = &udp_call_trace.recs[udp_call_trace.head];
+	r->seq = seq;
+	r->path_mask = path_mask;
+	r->cmsg_mask = cmsg_mask;
+	r->total_ns = total_ns;
+	r->entry_phase_ns = entry_phase_ns;
+	r->addr_phase_ns = addr_phase_ns;
+	r->ctrl_opt_phase_ns = ctrl_opt_phase_ns;
+	r->route_prep_phase_ns = route_prep_phase_ns;
+	r->dst_cache_phase_ns = dst_cache_phase_ns;
+	r->route_lookup_phase_ns = route_lookup_phase_ns;
+	r->fast_tx_phase_ns = fast_tx_phase_ns;
+	r->cork_setup_phase_ns = cork_setup_phase_ns;
+	r->append_push_phase_ns = append_push_phase_ns;
+	r->pid = current->pid;
+	r->cpu = raw_smp_processor_id();
+	r->saddr = saddr;
+	r->daddr = daddr;
+	r->sport = sport;
+	r->dport = dport;
+	get_task_comm(r->comm, current);
+
+	udp_call_trace.head = (udp_call_trace.head + 1) % UDP_CALL_TRACE_MAX;
+	if (udp_call_trace.count < UDP_CALL_TRACE_MAX)
+		udp_call_trace.count++;
+
+	spin_unlock_irqrestore(&udp_call_trace.lock, flags);
+}
+
+// static void udp_sendmsg_lat_cleanup_debugfs(void)
+// {
+// 	debugfs_remove_recursive(udp_lat_debugfs_dir);
+// }
+
+late_initcall(udp_sendmsg_lat_init_debugfs);
+
+// END TEST
+
+// TEST: tracepoints for udp_sendmsg path]
+enum udp_sendmsg_cmsg_bits {
+	UDP_CMSG_UDP_SEGMENT  = 1ULL << 0,
+	UDP_CMSG_SOL_SOCKET   = 1ULL << 1,
+	UDP_CMSG_IP_PKTINFO   = 1ULL << 2,
+	UDP_CMSG_IP_TTL       = 1ULL << 3,
+	UDP_CMSG_IP_TOS       = 1ULL << 4,
+	UDP_CMSG_IP_RETOPTS   = 1ULL << 5,
+	UDP_CMSG_IP_PROTOCOL  = 1ULL << 6,
+	UDP_CMSG_IPV6_PKTINFO = 1ULL << 7,
+};
+
+struct udp_path_trace_stats {
+	atomic64_t enabled;
+	atomic64_t total_calls;
+	atomic64_t bit_hits[UDP_PATH_NR_BITS];
+};
+
+enum udp_sendmsg_path_bits {
+	UDP_PATH_PENDING_ENTRY           = 1ULL << 0,
+	UDP_PATH_PENDING_APPEND          = 1ULL << 1,
+	UDP_PATH_ADDR_FROM_USIN          = 1ULL << 2,
+	UDP_PATH_ADDR_FROM_CONNECTED     = 1ULL << 3,
+	UDP_PATH_CMSG_PRESENT            = 1ULL << 4,
+	UDP_PATH_IP_CMSG_USED            = 1ULL << 5,
+	UDP_PATH_IP_OPT_FALLBACK         = 1ULL << 6,
+	UDP_PATH_BPF_HOOK_USED           = 1ULL << 7,
+	UDP_PATH_SOURCE_ROUTE            = 1ULL << 8,
+	UDP_PATH_LOCAL_OR_DONTROUTE      = 1ULL << 9,
+	UDP_PATH_MULTICAST               = 1ULL << 10,
+	UDP_PATH_LOCAL_BROADCAST         = 1ULL << 11,
+	UDP_PATH_CONNECTED_INPUT         = 1ULL << 12,
+	UDP_PATH_DST_CACHE_CHECK         = 1ULL << 13,
+	UDP_PATH_DST_CACHE_HIT           = 1ULL << 14,
+	UDP_PATH_ROUTE_LOOKUP            = 1ULL << 15,
+	UDP_PATH_ROUTE_ERR               = 1ULL << 16,
+	UDP_PATH_NON_CORK_FAST           = 1ULL << 17,
+	UDP_PATH_NEW_CORK_SETUP          = 1ULL << 18,
+	UDP_PATH_APPEND_DATA             = 1ULL << 19,
+	UDP_PATH_PUSH_PENDING            = 1ULL << 20,
+	UDP_PATH_FLUSH_PENDING           = 1ULL << 21,
+	UDP_PATH_BROADCAST_PERM_ERR      = 1ULL << 22,
+	UDP_PATH_ALREADY_CORKED_ERR      = 1ULL << 23,
+	UDP_PATH_SUCCESS                 = 1ULL << 24,
+	UDP_PATH_ERR_RET                 = 1ULL << 25,
+};
+
+static struct udp_path_trace_stats udp_path_stats;
+static struct dentry *udp_path_dbg_dir;
+
+static inline void udp_path_trace_record(u64 mask)
+{
+	int i;
+
+	if (!atomic64_read(&udp_path_stats.enabled))
+		return;
+
+	atomic64_inc(&udp_path_stats.total_calls);
+
+	for (i = 0; i < UDP_PATH_NR_BITS; i++) {
+		if (mask & (1ULL << i))
+			atomic64_inc(&udp_path_stats.bit_hits[i]);
+	}
+}
+
+static void udp_path_trace_clear_all(void)
+{
+	int i;
+
+	atomic64_set(&udp_path_stats.total_calls, 0);
+	for (i = 0; i < UDP_PATH_NR_BITS; i++)
+		atomic64_set(&udp_path_stats.bit_hits[i], 0);
+}
+
+static const char * const udp_path_bit_names[UDP_PATH_NR_BITS] = {
+	[0]  = "pending_entry",
+	[1]  = "pending_append",
+	[2]  = "addr_from_usin",
+	[3]  = "addr_from_connected",
+	[4]  = "cmsg_present",
+	[5]  = "ip_cmsg_used",
+	[6]  = "ip_opt_fallback",
+	[7]  = "bpf_hook_used",
+	[8]  = "source_route",
+	[9]  = "local_or_dontroute",
+	[10] = "multicast",
+	[11] = "local_broadcast",
+	[12] = "connected_input",
+	[13] = "dst_cache_check",
+	[14] = "dst_cache_hit",
+	[15] = "route_lookup",
+	[16] = "route_err",
+	[17] = "non_cork_fast",
+	[18] = "new_cork_setup",
+	[19] = "append_data",
+	[20] = "push_pending",
+	[21] = "flush_pending",
+	[22] = "broadcast_perm_err",
+	[23] = "already_corked_err",
+	[24] = "success",
+	[25] = "err_ret",
+};
+
+static u64 udp_collect_cmsg_mask(struct msghdr *msg, bool allow_ipv6)
+{
+	struct cmsghdr *cmsg;
+	u64 mask = 0;
+
+	for_each_cmsghdr(cmsg, msg) {
+		if (!CMSG_OK(msg, cmsg))
+			return mask;
+
+#if IS_ENABLED(CONFIG_IPV6)
+		if (allow_ipv6 &&
+		    cmsg->cmsg_level == SOL_IPV6 &&
+		    cmsg->cmsg_type == IPV6_PKTINFO) {
+			mask |= UDP_CMSG_IPV6_PKTINFO;
+			continue;
+		}
+#endif
+
+		if (cmsg->cmsg_level == SOL_SOCKET) {
+			mask |= UDP_CMSG_SOL_SOCKET;
+			continue;
+		}
+
+		if (cmsg->cmsg_level == SOL_UDP) {
+			switch (cmsg->cmsg_type) {
+			case UDP_SEGMENT:
+				mask |= UDP_CMSG_UDP_SEGMENT;
+				break;
+			default:
+				break;
+			}
+			continue;
+		}
+
+		if (cmsg->cmsg_level != SOL_IP)
+			continue;
+
+		switch (cmsg->cmsg_type) {
+		case IP_PKTINFO:
+			mask |= UDP_CMSG_IP_PKTINFO;
+			break;
+		case IP_TTL:
+			mask |= UDP_CMSG_IP_TTL;
+			break;
+		case IP_TOS:
+			mask |= UDP_CMSG_IP_TOS;
+			break;
+		case IP_RETOPTS:
+			mask |= UDP_CMSG_IP_RETOPTS;
+			break;
+		case IP_PROTOCOL:
+			mask |= UDP_CMSG_IP_PROTOCOL;
+			break;
+		default:
+			break;
+		}
+	}
+
+	return mask;
+}
+
+static int udp_path_trace_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	seq_printf(m, "enabled: %lld\n",
+		   (long long)atomic64_read(&udp_path_stats.enabled));
+	seq_printf(m, "total_calls: %lld\n",
+		   (long long)atomic64_read(&udp_path_stats.total_calls));
+
+	for (i = 0; i < UDP_PATH_NR_BITS; i++) {
+		seq_printf(m, "%2d %-24s %lld\n",
+			   i,
+			   udp_path_bit_names[i] ? udp_path_bit_names[i] : "unknown",
+			   (long long)atomic64_read(&udp_path_stats.bit_hits[i]));
+	}
+
+	return 0;
+}
+
+static int udp_path_trace_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, udp_path_trace_show, NULL);
+}
+
+static const struct file_operations udp_path_trace_fops = {
+	.owner   = THIS_MODULE,
+	.open    = udp_path_trace_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static ssize_t udp_path_enable_write(struct file *file,
+				     const char __user *buf,
+				     size_t len, loff_t *ppos)
+{
+	char kbuf[16];
+	long val;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (kstrtol(kbuf, 0, &val))
+		return -EINVAL;
+
+	atomic64_set(&udp_path_stats.enabled, !!val);
+	return len;
+}
+
+static ssize_t udp_path_enable_read(struct file *file,
+				    char __user *buf,
+				    size_t len, loff_t *ppos)
+{
+	char kbuf[8];
+	int n;
+
+	n = scnprintf(kbuf, sizeof(kbuf), "%lld\n",
+		      (long long)atomic64_read(&udp_path_stats.enabled));
+	return simple_read_from_buffer(buf, len, ppos, kbuf, n);
+}
+
+static const struct file_operations udp_path_enable_fops = {
+	.owner = THIS_MODULE,
+	.read  = udp_path_enable_read,
+	.write = udp_path_enable_write,
+	.llseek = default_llseek,
+};
+
+static ssize_t udp_path_clear_write(struct file *file,
+				    const char __user *buf,
+				    size_t len, loff_t *ppos)
+{
+	udp_path_trace_clear_all();
+	return len;
+}
+
+static const struct file_operations udp_path_clear_fops = {
+	.owner = THIS_MODULE,
+	.write = udp_path_clear_write,
+	.llseek = no_llseek,
+};
+
+void __init udp_path_trace_debugfs_init(void)
+{
+	udp_path_dbg_dir = debugfs_create_dir("udp_path_trace", NULL);
+	if (!udp_path_dbg_dir)
+		return;
+
+	debugfs_create_file("stats", 0444, udp_path_dbg_dir, NULL,
+			    &udp_path_trace_fops);
+	debugfs_create_file("enable", 0644, udp_path_dbg_dir, NULL,
+			    &udp_path_enable_fops);
+	debugfs_create_file("clear", 0200, udp_path_dbg_dir, NULL,
+			    &udp_path_clear_fops);
+
+	atomic64_set(&udp_path_stats.enabled, 0);
+	udp_path_trace_clear_all();
+}
+
+static int __init udp_path_trace_init_debugfs(void)
+{
+	udp_path_trace_debugfs_init();
+	return 0;
+}
+
+late_initcall(udp_path_trace_init_debugfs);
+
+// END TEST
+
 struct udp_table udp_table __read_mostly;
 EXPORT_SYMBOL(udp_table);
 
@@ -1072,6 +2009,25 @@ EXPORT_SYMBOL_GPL(udp_cmsg_send);
 
 int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
+	// Test : latency
+	u64 __lat_t0, __lat_t1;
+	u64 __phase_t0, __phase_t1;
+
+	u64 __entry_phase_ns = 0;
+	u64 __addr_phase_ns = 0;
+	u64 __ctrl_opt_phase_ns = 0;
+	u64 __route_prep_phase_ns = 0;
+	u64 __dst_cache_phase_ns = 0;
+	u64 __route_lookup_phase_ns = 0;
+	u64 __fast_tx_phase_ns = 0;
+	u64 __cork_setup_phase_ns = 0;
+	u64 __append_push_phase_ns = 0;
+	// End test
+	// Test : path mask
+	u64 __path_mask = 0;
+	u64 __cmsg_mask = 0;
+	// End test
+
 	//	static inline struct inet_sock *inet_sk(const struct sock *sk)
 	//	{
 	//		return (struct inet_sock *)sk;
@@ -1121,6 +2077,15 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	struct sk_buff *skb;
 	struct ip_options_data opt_copy;
 
+	// Test
+	__lat_t0 = ktime_get_ns();
+	// End test
+
+	/* 
+	*	ENTRY_PHASE
+	*/
+	__phase_t0 = ktime_get_ns();
+
 	// 이건 대충 길이 검사 일단 너무 큰지만 확인하는 듯...? 후에 확인하는 코드가 추가로 있다.
 	if (len > 0xFFFF)
 		return -EMSGSIZE;
@@ -1143,21 +2108,29 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		 * There are pending frames.
 		 * The socket lock must be held while it's corked.
 		 */
+		__path_mask |= UDP_PATH_PENDING_ENTRY;
 		lock_sock(sk);
 		if (likely(up->pending)) { // 이게 참일 확률이 높다 라는 힌트를 컴파일러에게 줌.
 			if (unlikely(up->pending != AF_INET)) { // 이게 거짓일 확률이 높다는 힌트를 줌.
 				release_sock(sk);
 				return -EINVAL; // IPV4가 아닌 경우에 타게 됨.
 			}
+			__path_mask |= UDP_PATH_PENDING_APPEND;
+			__phase_t1 = ktime_get_ns();
+			__entry_phase_ns = __phase_t1 - __phase_t0;
 			goto do_append_data;
 		}
 		release_sock(sk);
 	}
 	ulen += sizeof(struct udphdr);
+	__phase_t1 = ktime_get_ns();
+	__entry_phase_ns = __phase_t1 - __phase_t0;
 	/*
 	 *	Get and verify the address.
 	 */
+	__phase_t0 = ktime_get_ns();
 	if (usin) { // usin이 존재하면 여기서 주소 꺼냄 .
+		__path_mask |= UDP_PATH_ADDR_FROM_USIN;
 		if (msg->msg_namelen < sizeof(*usin))
 			return -EINVAL;
 		if (usin->sin_family != AF_INET) { // IPv4?
@@ -1170,6 +2143,7 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		if (dport == 0)
 			return -EINVAL;
 	} else { // 아니면 여기서 주소 꺼냄.
+		__path_mask |= UDP_PATH_ADDR_FROM_CONNECTED | UDP_PATH_CONNECTED_INPUT;
 		if (sk->sk_state != TCP_ESTABLISHED) // 연결된 소켓이 존재하면 넘어가는 거 같은데.. udp에서도 연결이라는 말을 쓸 수 있다고 한다. 연결된 소켓이 존재한다는 것은, 목적지 주소와 포트가 이미 소켓에 설정되어 있다는 뜻이 될 듯.
 			return -EDESTADDRREQ;
 		daddr = inet->inet_daddr;
@@ -1179,13 +2153,23 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		 */
 		connected = 1; // 이게 켜지면 fast path가 열리나? 새로 라우팅 안 한다는 의미인 거 같음.
 	}
+	__phase_t1 = ktime_get_ns();
+	__addr_phase_ns = __phase_t1 - __phase_t0;
 
+
+	/*
+	 *	CTRL_OPT_PHASE
+	 */
+	__phase_t0 = ktime_get_ns();
 	ipcm_init_sk(&ipc, inet); // 소켓에 있는 정보를 ipc로 이동.
 	ipc.gso_size = READ_ONCE(up->gso_size); // GSO는 Generic Segmentation Offload의 약자로, 네트워크 카드가 큰 패킷을 작은 패킷으로 나눠서 보내주는 기능인데, 그 때 나눌 패킷의 최대 크기를 나타내는 듯.
 
 	if (msg->msg_controllen) { // UDP/IP control message(cmsg) 가 있으면 그걸 먼저 반영
+		__path_mask |= UDP_PATH_CMSG_PRESENT;
+		__cmsg_mask = udp_collect_cmsg_mask(msg, sk->sk_family == AF_INET6);
 		err = udp_cmsg_send(sk, msg, &ipc.gso_size); // 먼저 UDP 레벨 cmsg
 		if (err > 0) { // 필요하면 그다음 IP 레벨 cmsg
+			__path_mask |= UDP_PATH_IP_CMSG_USED;
 			err = ip_cmsg_send(sk, msg, &ipc,
 					   sk->sk_family == AF_INET6);
 			connected = 0;
@@ -1208,6 +2192,7 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		rcu_read_lock(); // 여기서 락을 거네? 왜 거는거지? 현재 reader들이 다 빠져나갈 때까지 기다렸다가 그 다음에 읽기 위해서 걸어둔다는 느낌인 거 같다.
 		inet_opt = rcu_dereference(inet->inet_opt); // RCU로 관리되는 포인터를 읽을 때 쓰는 전용 helper 함수..?
 		if (inet_opt) {
+			__path_mask |= UDP_PATH_IP_OPT_FALLBACK;
 			memcpy(&opt_copy, inet_opt,
 			       sizeof(*inet_opt) + inet_opt->opt.optlen);
 			ipc.opt = &opt_copy.opt;
@@ -1218,6 +2203,7 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	// 이 send 요청을 커널 BPF 정책이 가로채서 검사하거나 수정해야 하면 가로채서 설정이나 목적지 같은 걸 바꿈.
 	//BPF 프로그램은 send 전에 정책 개입을 할 수 있다. 커널 코드를 직접 바꾸지 않고도 BPF 프로그램을 통해 sendmsg의 동작을 바꿀 수 있게 해주는 거 같은데, 예를 들어 목적지 주소를 바꿔서 다른 곳으로 보내게 할 수도 있고, 특정 조건에서 send 자체를 막아버릴 수도 있을 듯.
 	if (cgroup_bpf_enabled(CGROUP_UDP4_SENDMSG) && !connected) { // cgroup_bpf_enabled는 그냥 켜져있는지 확인하는 함수.
+		__path_mask |= UDP_PATH_BPF_HOOK_USED;
 		err = BPF_CGROUP_RUN_PROG_UDP4_SENDMSG_LOCK(sk,
 					    (struct sockaddr *)usin, &ipc.addr);
 		if (err) // BPF 프로그램이 sendmsg를 막아버리는 경우
@@ -1233,11 +2219,19 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		}
 	}
 
+	__phase_t1 = ktime_get_ns();
+	__ctrl_opt_phase_ns = __phase_t1 - __phase_t0;
+
+	/*
+	 *	ROUTE_PREP_PHASE
+	 */
+	__phase_t0 = ktime_get_ns();
 	saddr = ipc.addr; // 기존 주소 임시 저장.
 	ipc.addr = faddr = daddr; // ipc.addr의 의미를 목적지 주소로 변환하는 것으로 해석하는게 맞을 듯.
 	// 목적지 주소를 ipc에 저장. faddr은 목적지 주소로 보이는 거 같은데, 왜 따로 저장하는지는 모르겠음.
 
 	if (ipc.opt && ipc.opt->opt.srr) { // 중간에 경유지를 두는 옵션 daddr이 목적지이고 중간에 faddr을 추가함.
+		__path_mask |= UDP_PATH_SOURCE_ROUTE;
 		if (!daddr) {
 			err = -EINVAL;
 			goto out_free;
@@ -1249,12 +2243,14 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	if (sock_flag(sk, SOCK_LOCALROUTE) ||
 	    (msg->msg_flags & MSG_DONTROUTE) ||
 	    (ipc.opt && ipc.opt->opt.is_strictroute)) { // 따로 인터페이스를 정해두고 거기로 나가게 함.
+		__path_mask |= UDP_PATH_LOCAL_OR_DONTROUTE;
 		tos |= RTO_ONLINK;
 		connected = 0; // 이번 송신에 route lookup 조건이 바뀌었다는 뜻이라 그런 듯.
 	}
 
 	if (ipv4_is_multicast(daddr)) { // 멀티캐스트일 때
 		// 멀티캐스트면 일반 유니캐스트처럼 peer 하나에 보내는 게 아니라, 그룹 주소로 어느 인터페이스를 통해 보내야 하는지 유니캐스트랑 달라지니까 따로 주소를 주는 듯
+		__path_mask |= UDP_PATH_MULTICAST;
 		if (!ipc.oif || netif_index_is_l3_master(sock_net(sk), ipc.oif))
 			ipc.oif = inet->mc_index;
 		if (!saddr)
@@ -1270,18 +2266,41 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		 * If so, we want to allow the send using the uc_index.
 		 */
 		// 커널 내부에서 잡힌 논리 인터페이스와 실제 송신 인터페이스가 다를 수 있으니, 브로드캐스트 같은 경우는 실제 나가야 할 인터페이스로 보정하는 것?
+		__path_mask |= UDP_PATH_LOCAL_BROADCAST;
 		if (ipc.oif != inet->uc_index &&
 		    ipc.oif == l3mdev_master_ifindex_by_index(sock_net(sk),
 							      inet->uc_index)) {
 			ipc.oif = inet->uc_index;
 		}
 	}
+	__phase_t1 = ktime_get_ns();
+	__route_prep_phase_ns = __phase_t1 - __phase_t0;
 
 
-	if (connected)
+	if (connected) {
+		/*
+		*	DST_CACHE_PHASE
+		*/
+		__phase_t0 = ktime_get_ns();
+
+		__path_mask |= UDP_PATH_DST_CACHE_CHECK;
+
 		rt = (struct rtable *)sk_dst_check(sk, 0);
 
+		__phase_t1 = ktime_get_ns();
+		__dst_cache_phase_ns = __phase_t1 - __phase_t0;
+
+		if (rt)
+			__path_mask |= UDP_PATH_DST_CACHE_HIT;
+		
+	}
+
 	if (!rt) { // 재사용할 수 없으면 라우팅!
+		/*
+		*	ROUTE_LOOKUP_PHASE
+		*/
+		__phase_t0 = ktime_get_ns();
+		__path_mask |= UDP_PATH_ROUTE_LOOKUP;
 		struct net *net = sock_net(sk);
 		__u8 flow_flags = inet_sk_flowi_flags(sk);
 
@@ -1320,18 +2339,27 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		security_sk_classify_flow(sk, flowi4_to_flowi_common(fl4));
 		rt = ip_route_output_flow(net, fl4, sk); // 이게 라우팅
 		if (IS_ERR(rt)) { // 에러 처리
+			__path_mask |= UDP_PATH_ROUTE_ERR;
 			err = PTR_ERR(rt);
 			rt = NULL;
 			if (err == -ENETUNREACH)
 				IP_INC_STATS(net, IPSTATS_MIB_OUTNOROUTES);
+			__phase_t1 = ktime_get_ns();
+			__route_lookup_phase_ns = __phase_t1 - __phase_t0;
 			goto out;
 		}
 
 		err = -EACCES;
-		if ((rt->rt_flags & RTCF_BROADCAST) && !sock_flag(sk, SOCK_BROADCAST)) // 브로드캐스트 권한 가진 소켓인지 확인
+		if ((rt->rt_flags & RTCF_BROADCAST) && !sock_flag(sk, SOCK_BROADCAST)) { // 브로드캐스트 권한 가진 소켓인지 확인
+			__path_mask |= UDP_PATH_BROADCAST_PERM_ERR;
+			__phase_t1 = ktime_get_ns();
+			__route_lookup_phase_ns = __phase_t1 - __phase_t0;
 			goto out;
+		}
 		if (connected)
 			sk_dst_set(sk, dst_clone(&rt->dst));
+		__phase_t1 = ktime_get_ns();
+		__route_lookup_phase_ns = __phase_t1 - __phase_t0;
 	}
 
 	if (msg->msg_flags&MSG_CONFIRM) // 경로/neighbor 상태만 확인? 특수한 경로인 듯.
@@ -1344,7 +2372,12 @@ back_from_confirm:
 
 	/* Lockless fast path for the non-corking case. */
 	if (!corkreq) { // 코르크 아니면 빨리 보냄 fast path는 그냥 빠르게 보낸다임. 라우팅에서 캐쉬 이용하는거랑 다른 개념
+		/*
+		*	FAST_TX_PHASE
+		*/
+		__path_mask |= UDP_PATH_NON_CORK_FAST;
 		
+		__phase_t0 = ktime_get_ns();
 
 		struct inet_cork cork;
 
@@ -1354,12 +2387,21 @@ back_from_confirm:
 		err = PTR_ERR(skb);
 		if (!IS_ERR_OR_NULL(skb))
 			err = udp_send_skb(skb, fl4, &cork);
-
+		
+		__phase_t1 = ktime_get_ns();
+		__fast_tx_phase_ns = __phase_t1 - __phase_t0;
 		goto out;
 	}
 
+	/*
+	*	CORK_SETUP_PHASE
+	*/
+
+	__phase_t0 = ktime_get_ns();
 	lock_sock(sk);
+	__path_mask |= UDP_PATH_NEW_CORK_SETUP;
 	if (unlikely(up->pending)) { // 펜딩 상태이면 여기까지 오면 안된다는 의미임. 원래 append로 goto 하잖음.
+		__path_mask |= UDP_PATH_ALREADY_CORKED_ERR;
 		/* The socket is already corked while preparing it. */
 		/* ... which is an evident application bug. --ANK */
 		release_sock(sk);
@@ -1378,7 +2420,15 @@ back_from_confirm:
 	fl4->fl4_sport = inet->inet_sport;
 	up->pending = AF_INET;
 
+	__phase_t1 = ktime_get_ns();
+	__cork_setup_phase_ns = __phase_t1 - __phase_t0;
+
 do_append_data:
+	/*
+	*	APPEND_PUSH_PHASE
+	*/
+	__phase_t0 = ktime_get_ns();
+	__path_mask |= UDP_PATH_APPEND_DATA;
 	up->len += ulen;
 	// 소켓의 버퍼에 집어넣는 과정인 듯 합니다.
 	err = ip_append_data(sk, fl4, getfrag, msg, ulen,
@@ -1386,18 +2436,63 @@ do_append_data:
 			     corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
 
 	if (err) {
+		__path_mask |= UDP_PATH_FLUSH_PENDING;
 		udp_flush_pending_frames(sk);
 	} else if (!corkreq) {
+		__path_mask |= UDP_PATH_PUSH_PENDING;
 		err = udp_push_pending_frames(sk);
 	}
 	else if (unlikely(skb_queue_empty(&sk->sk_write_queue)))
 		up->pending = 0;
 	release_sock(sk);
+	__phase_t1 = ktime_get_ns();
+	__append_push_phase_ns = __phase_t1 - __phase_t0;
 out:
 	ip_rt_put(rt); // 이것도 정리하는 함수
 out_free:
 	if (free)
 		kfree(ipc.opt);
+
+	if (!err)
+		__path_mask |= UDP_PATH_SUCCESS;
+	else
+		__path_mask |= UDP_PATH_ERR_RET;
+	// Test : latency
+	__lat_t1 = ktime_get_ns();
+	{
+		u64 __total_ns = __lat_t1 - __lat_t0;
+
+		udp_sendmsg_lat_record_stage(UDP_LAT_TOTAL, __total_ns);
+		udp_call_trace_record(__path_mask,
+				      __cmsg_mask,
+				      __total_ns,
+				      __entry_phase_ns,
+				      __addr_phase_ns,
+				      __ctrl_opt_phase_ns,
+				      __route_prep_phase_ns,
+				      __dst_cache_phase_ns,
+				      __route_lookup_phase_ns,
+				      __fast_tx_phase_ns,
+				      __cork_setup_phase_ns,
+				      __append_push_phase_ns,
+				      fl4->saddr,
+				      fl4->daddr,
+				      fl4->fl4_sport,
+				      fl4->fl4_dport);
+	}
+	// End test
+	// Test : path mask
+	udp_path_trace_record(__path_mask);
+	udp_sendmsg_lat_record_stage(UDP_LAT_ENTRY_PHASE, __entry_phase_ns);
+	udp_sendmsg_lat_record_stage(UDP_LAT_ADDR_PHASE, __addr_phase_ns);
+	udp_sendmsg_lat_record_stage(UDP_LAT_CTRL_OPT_PHASE, __ctrl_opt_phase_ns);
+	udp_sendmsg_lat_record_stage(UDP_LAT_ROUTE_PREP_PHASE, __route_prep_phase_ns);
+	udp_sendmsg_lat_record_stage(UDP_LAT_DST_CACHE_PHASE, __dst_cache_phase_ns);
+	udp_sendmsg_lat_record_stage(UDP_LAT_ROUTE_LOOKUP_PHASE, __route_lookup_phase_ns);
+	udp_sendmsg_lat_record_stage(UDP_LAT_FAST_TX_PHASE, __fast_tx_phase_ns);
+	udp_sendmsg_lat_record_stage(UDP_LAT_CORK_SETUP_PHASE, __cork_setup_phase_ns);
+	udp_sendmsg_lat_record_stage(UDP_LAT_APPEND_PUSH_PHASE, __append_push_phase_ns);
+	// End test
 
 	if (!err)
 		return len;
